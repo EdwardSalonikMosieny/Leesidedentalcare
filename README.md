@@ -56,3 +56,9 @@ npm run dev:client
 - Optional fields: `phone`, `attachment`
 - Attachment rules: image only, max 5MB
 - Form submissions are emailed to `LEESIDE_RECEIVER_EMAIL`
+
+## GitHub CI/CD
+
+- Workflow: `.github/workflows/deploy-prod.yml`
+- PM2 runtime config: `ecosystem.config.json`
+- Required GitHub Actions secrets: `SECRETS.md`

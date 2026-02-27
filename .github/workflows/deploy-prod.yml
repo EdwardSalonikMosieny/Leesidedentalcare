@@ -1,0 +1,209 @@
+name: Deploy Production - leesidedentalcareltd.co.ke
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "20"
+  APP_NAME: "leesidedental"
+  HEALTH_URL: "https://leesidedentalcareltd.co.ke"
+  PROD_PATH: ${{ secrets.PROD_PATH }}
+
+jobs:
+  security:
+    name: Security Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history for secret scan)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Secret scanning - Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Dependency vulnerability audit (non-blocking)
+        run: npm audit --audit-level=high || true
+
+  build:
+    name: Build
+    needs: security
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ github.sha }}
+          path: dist/
+          retention-days: 7
+
+  deploy:
+    name: Deploy to Production
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout (for runtime files + ecosystem config)
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-${{ github.sha }}
+          path: dist/
+
+      - name: Add SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Add known hosts
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "${{ secrets.SSH_KNOWN_HOSTS }}" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Verify SSH connection
+        run: |
+          ssh -o BatchMode=yes \
+              -o ConnectTimeout=10 \
+              -o ServerAliveInterval=30 \
+              "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+              "echo 'SSH OK'"
+
+      - name: Backup current build (for rollback)
+        run: |
+          ssh -o BatchMode=yes -o ServerAliveInterval=30 \
+              "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" "
+            mkdir -p ${{ env.PROD_PATH }}/../backups
+            if [ -d ${{ env.PROD_PATH }}/dist ]; then
+              cp -r ${{ env.PROD_PATH }}/dist ${{ env.PROD_PATH }}/../backups/dist.\$(date +%Y%m%d_%H%M%S)
+              ls -dt ${{ env.PROD_PATH }}/../backups/dist.* 2>/dev/null | tail -n +4 | xargs rm -rf || true
+            fi
+          "
+
+      - name: Sync dist files
+        run: |
+          rsync -az --delete \
+            --exclude "node_modules" \
+            --exclude ".git" \
+            --exclude ".env*" \
+            --exclude ".DS_Store" \
+            --exclude "*.log" \
+            --exclude ".cache" \
+            --exclude "coverage" \
+            -e "ssh -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3" \
+            dist/ \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${{ env.PROD_PATH }}/dist/"
+
+      - name: Sync runtime files
+        run: |
+          rsync -az \
+            -e "ssh -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3" \
+            package.json package-lock.json ecosystem.config.json \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${{ env.PROD_PATH }}/"
+
+          rsync -az \
+            -e "ssh -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3" \
+            server/ \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${{ env.PROD_PATH }}/server/"
+
+      - name: Install production dependencies
+        run: |
+          ssh -o BatchMode=yes -o ServerAliveInterval=30 \
+              "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+              "cd ${{ env.PROD_PATH }} && mkdir -p logs && npm ci --omit=dev --prefer-offline"
+
+      - name: Restart service
+        run: |
+          ssh -o BatchMode=yes -o ServerAliveInterval=30 \
+              "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" "
+            pm2 startOrRestart ${{ env.PROD_PATH }}/ecosystem.config.json \
+              --only ${{ env.APP_NAME }} --update-env \
+            && pm2 save
+          "
+
+      - name: Health check (with retries)
+        run: |
+          sleep 8
+          max=5
+          interval=10
+          for i in $(seq 1 $max); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" \
+                     --max-time 15 --connect-timeout 10 \
+                     "${{ env.HEALTH_URL }}" || echo "000")
+            if [[ "$code" =~ ^(200|301|302|401)$ ]]; then
+              echo "Health check passed (HTTP $code) on attempt $i"
+              exit 0
+            fi
+            echo "Attempt $i/$max - HTTP $code - retrying in ${interval}s..."
+            [ $i -lt $max ] && sleep $interval
+          done
+          echo "Health check failed after $max attempts"
+          exit 1
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "Deploy failed - rolling back..."
+          ssh -o BatchMode=yes -o ServerAliveInterval=30 \
+              "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" "
+            latest=\$(ls -dt ${{ env.PROD_PATH }}/../backups/dist.* 2>/dev/null | head -1)
+            if [ -n \"\$latest\" ]; then
+              rm -rf ${{ env.PROD_PATH }}/dist
+              cp -r \"\$latest\" ${{ env.PROD_PATH }}/dist
+              pm2 restart ${{ env.APP_NAME }} && pm2 save
+              echo \"Rolled back to \$latest\"
+            else
+              echo 'No backup found - manual intervention required'
+              exit 1
+            fi
+          "
+
+      - name: Deployment summary
+        if: success()
+        run: |
+          {
+            echo "## Deployment Successful"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **URL** | ${{ env.HEALTH_URL }} |"
+            echo "| **Path** | ${{ env.PROD_PATH }} |"
+            echo "| **Commit** | \`${{ github.sha }}\` |"
+            echo "| **Branch** | \`${{ github.ref_name }}\` |"
+            echo "| **Triggered by** | ${{ github.actor }} |"
+            echo "| **Time** | $(date -u) |"
+          } >> $GITHUB_STEP_SUMMARY

@@ -14,6 +14,7 @@ env:
   APP_NAME: "leesidedental"
   HEALTH_URL: "https://leesidedentalcareltd.co.ke"
   PROD_PATH: ${{ secrets.PROD_PATH }}
+  SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
 
 jobs:
   security:
@@ -89,25 +90,42 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
 
-      - name: Add known hosts
+      - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          echo "${{ secrets.SSH_KNOWN_HOSTS }}" >> ~/.ssh/known_hosts
+
+          # Populate known_hosts — prefer the secret, fall back to ssh-keyscan
+          if [ -n "$SSH_KNOWN_HOSTS" ]; then
+            echo "SSH_KNOWN_HOSTS is set ($(echo "$SSH_KNOWN_HOSTS" | wc -c) bytes) — using secret"
+            echo "$SSH_KNOWN_HOSTS" >> ~/.ssh/known_hosts
+          else
+            echo "SSH_KNOWN_HOSTS is empty — falling back to ssh-keyscan"
+            ssh-keyscan -H -T 10 "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
+          fi
           chmod 600 ~/.ssh/known_hosts
 
-      - name: Verify SSH connection
-        run: |
-          ssh -o BatchMode=yes \
-              -o ConnectTimeout=10 \
-              -o ServerAliveInterval=30 \
-              "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
-              "echo 'SSH OK'"
+          # ControlMaster: open one TCP connection and reuse it for all subsequent steps
+          cat >> ~/.ssh/config << EOF
+          Host deploy-target
+            HostName ${{ secrets.SSH_HOST }}
+            User ${{ secrets.SSH_USER }}
+            ControlMaster auto
+            ControlPath /tmp/ssh-deploy
+            ControlPersist 30m
+            BatchMode yes
+            ConnectTimeout 15
+            ServerAliveInterval 30
+            ServerAliveCountMax 3
+          EOF
+          chmod 600 ~/.ssh/config
+
+          # Open the master connection — all subsequent ssh/rsync steps reuse this socket
+          ssh deploy-target "echo 'SSH connection established'"
 
       - name: Backup current build (for rollback)
         run: |
-          ssh -o BatchMode=yes -o ServerAliveInterval=30 \
-              "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" "
+          ssh deploy-target "
             mkdir -p ${{ env.PROD_PATH }}/../backups
             if [ -d ${{ env.PROD_PATH }}/dist ]; then
               cp -r ${{ env.PROD_PATH }}/dist ${{ env.PROD_PATH }}/../backups/dist.\$(date +%Y%m%d_%H%M%S)
@@ -125,32 +143,23 @@ jobs:
             --exclude "*.log" \
             --exclude ".cache" \
             --exclude "coverage" \
-            -e "ssh -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3" \
             dist/ \
-            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${{ env.PROD_PATH }}/dist/"
+            "deploy-target:${{ env.PROD_PATH }}/dist/"
 
       - name: Sync runtime files
         run: |
           rsync -az \
-            -e "ssh -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3" \
             package.json package-lock.json ecosystem.config.json \
-            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${{ env.PROD_PATH }}/"
+            "deploy-target:${{ env.PROD_PATH }}/"
 
           rsync -az \
-            -e "ssh -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3" \
             server/ \
-            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${{ env.PROD_PATH }}/server/"
+            "deploy-target:${{ env.PROD_PATH }}/server/"
 
-      - name: Install production dependencies
+      - name: Install dependencies and restart service
         run: |
-          ssh -o BatchMode=yes -o ServerAliveInterval=30 \
-              "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
-              "cd ${{ env.PROD_PATH }} && mkdir -p logs && npm ci --omit=dev --prefer-offline"
-
-      - name: Restart service
-        run: |
-          ssh -o BatchMode=yes -o ServerAliveInterval=30 \
-              "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" "
+          ssh deploy-target "
+            cd ${{ env.PROD_PATH }} && mkdir -p logs && npm ci --omit=dev --prefer-offline
             pm2 startOrRestart ${{ env.PROD_PATH }}/ecosystem.config.json \
               --only ${{ env.APP_NAME }} --update-env \
             && pm2 save
@@ -179,8 +188,7 @@ jobs:
         if: failure()
         run: |
           echo "Deploy failed - rolling back..."
-          ssh -o BatchMode=yes -o ServerAliveInterval=30 \
-              "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" "
+          ssh deploy-target "
             latest=\$(ls -dt ${{ env.PROD_PATH }}/../backups/dist.* 2>/dev/null | head -1)
             if [ -n \"\$latest\" ]; then
               rm -rf ${{ env.PROD_PATH }}/dist

@@ -11,7 +11,6 @@ concurrency:
 
 env:
   NODE_VERSION: "20"
-  APP_NAME: "leesidedental"
   HEALTH_URL: "https://leesidedentalcareltd.co.ke"
   PROD_PATH: ${{ secrets.PROD_PATH }}
   SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
@@ -76,7 +75,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
-      - name: Checkout (for runtime files + ecosystem config)
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Download build artifact
@@ -146,23 +145,24 @@ jobs:
             dist/ \
             "deploy-target:${{ env.PROD_PATH }}/dist/"
 
-      - name: Sync runtime files
-        run: |
-          rsync -az \
-            package.json package-lock.json ecosystem.config.json \
-            "deploy-target:${{ env.PROD_PATH }}/"
-
-          rsync -az \
-            server/ \
-            "deploy-target:${{ env.PROD_PATH }}/server/"
-
-      - name: Install dependencies and restart service
+      - name: Stop legacy PM2 services
         run: |
           ssh deploy-target "
-            cd ${{ env.PROD_PATH }} && mkdir -p logs && npm ci --omit=dev --prefer-offline
-            pm2 startOrRestart ${{ env.PROD_PATH }}/ecosystem.config.json \
-              --only ${{ env.APP_NAME }} --update-env \
-            && pm2 save
+            if command -v pm2 >/dev/null 2>&1; then
+              pm2 delete all || true
+              pm2 save --force || true
+            fi
+          "
+
+      - name: Remove legacy Node runtime files
+        run: |
+          ssh deploy-target "
+            rm -rf ${{ env.PROD_PATH }}/server \
+                   ${{ env.PROD_PATH }}/node_modules \
+                   ${{ env.PROD_PATH }}/logs \
+                   ${{ env.PROD_PATH }}/ecosystem.config.json \
+                   ${{ env.PROD_PATH }}/package.json \
+                   ${{ env.PROD_PATH }}/package-lock.json
           "
 
       - name: Health check (with retries)
@@ -193,7 +193,6 @@ jobs:
             if [ -n \"\$latest\" ]; then
               rm -rf ${{ env.PROD_PATH }}/dist
               cp -r \"\$latest\" ${{ env.PROD_PATH }}/dist
-              pm2 restart ${{ env.APP_NAME }} && pm2 save
               echo \"Rolled back to \$latest\"
             else
               echo 'No backup found - manual intervention required'
